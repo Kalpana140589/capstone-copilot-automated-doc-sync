@@ -1,0 +1,120 @@
+# .github/workflows/docs-sync.yml
+name: Automated Documentation Sync
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      merge_commit_sha:
+        description: "Merge commit SHA to (re)process (optional; primarily for debugging). If empty, uses event payload."
+        required: false
+        type: string
+
+# Least-privilege permissions for creating a branch + committing docs + opening PRs
+# (Prefer using a GitHub App token; if using GITHUB_TOKEN, ensure repo settings allow it.)
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  metadata: read
+
+jobs:
+  docs-sync:
+    # Only run automatically when the PR was merged into main
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'closed' &&
+       github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'main')
+
+    runs-on: ubuntu-latest
+
+    # Concurrency keyed by merge commit SHA (prevents duplicate PRs for the same merge)
+    concurrency:
+      group: docs-sync-${{ github.event.pull_request.merge_commit_sha || inputs.merge_commit_sha }}
+      cancel-in-progress: false
+
+    env:
+      # Correlation IDs / run context (script should log these on every line)
+      DOCSYNC_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      DOCSYNC_TRIGGER: ${{ github.event_name }}
+      DOCSYNC_REPO: ${{ github.repository }}
+      DOCSYNC_MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha || inputs.merge_commit_sha }}
+
+      # Config location (versioned in repo)
+      DOCSYNC_CONFIG_PATH: .github/docs-sync.yml
+
+      # GitHub API base (helps with GHES later)
+      GITHUB_API_URL: ${{ github.api_url }}
+
+    steps:
+      - name: Validate merge_commit_sha is present
+      # For workflow_dispatch runs, we require an explicit merge_commit_sha
+        if: ${{ env.DOCSYNC_MERGE_COMMIT_SHA == '' }}
+        run: |
+          echo "merge_commit_sha is required (event payload missing and no input provided)." >&2
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # We need full history rarely; keep shallow for speed unless your diff logic needs more.
+          fetch-depth: 1
+
+      - name: Show run context (safe)
+        run: |
+          echo "DOCSYNC_RUN_ID=${DOCSYNC_RUN_ID}"
+          echo "DOCSYNC_TRIGGER=${DOCSYNC_TRIGGER}"
+          echo "DOCSYNC_REPO=${DOCSYNC_REPO}"
+          echo "DOCSYNC_MERGE_COMMIT_SHA=${DOCSYNC_MERGE_COMMIT_SHA}"
+          echo "DOCSYNC_CONFIG_PATH=${DOCSYNC_CONFIG_PATH}"
+
+      - name: Set up Python
+        # If you're using Node, replace this section accordingly.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Adjust to your repo (requirements.txt / pyproject.toml)
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run documentation sync
+        env:
+          # Prefer GitHub App token if available; fall back to GITHUB_TOKEN for capstone simplicity.
+          # Recommended: set DOCSYNC_GITHUB_TOKEN to a GitHub App installation token.
+          DOCSYNC_GITHUB_TOKEN: ${{ secrets.DOCSYNC_GITHUB_TOKEN || github.token }}
+
+          # LLM secure proxy credentials / endpoint (names are placeholders; align to your environment)
+          LLM_PROXY_URL: ${{ secrets.LLM_PROXY_URL }}
+          LLM_PROXY_API_KEY: ${{ secrets.LLM_PROXY_API_KEY }}
+        run: |
+          # Example invocation; adjust to your actual entrypoint.
+          # The script should:
+          # - load/validate .github/docs-sync.yml first
+          # - use merge_commit_sha as idempotency key
+          # - emit structured logs with DOCSYNC_RUN_ID
+          python -m doc_sync \
+            --config "${DOCSYNC_CONFIG_PATH}" \
+            --repo "${DOCSYNC_REPO}" \
+            --merge-commit-sha "${DOCSYNC_MERGE_COMMIT_SHA}" \
+            --run-id "${DOCSYNC_RUN_ID}" \
+            --trigger "${DOCSYNC_TRIGGER}"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Automated Documentation Sync"
+            echo ""
+            echo "- Run ID: \`${DOCSYNC_RUN_ID}\`"
+            echo "- Trigger: \`${DOCSYNC_TRIGGER}\`"
+            echo "- Repo: \`${DOCSYNC_REPO}\`"
+            echo "- Merge Commit SHA: \`${DOCSYNC_MERGE_COMMIT_SHA}\`"
+            echo ""
+            echo "> See workflow logs for status, reason codes, and PR URL (if created)."
+          } >> "$GITHUB_STEP_SUMMARY"

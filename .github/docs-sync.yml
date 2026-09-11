@@ -1,0 +1,98 @@
+# .github/docs-sync.yml
+# Automated Documentation Sync (v1) configuration
+# Source of truth: code -> docs
+# Scope: README.md and /docs/**/*.md only
+
+version: 1
+
+repo:
+  default_branch: main
+
+docs:
+  # Only these paths may be modified by the automation (enforced by policy gate)
+  allowed_paths:
+    - "README.md"
+    - "docs/**/*.md"
+
+sync:
+  # Branch created only when UPDATE_NEEDED to avoid clutter
+  branch_prefix: "docs-sync-"
+  pr:
+    title: "docs: automated documentation synchronization"
+    labels:
+      - "documentation"
+      - "automated"
+    body:
+      include_run_id: true
+      include_merge_commit_sha: true
+      include_source_pr_link: true
+  cleanup_policy:
+    # If the run fails before creating a PR, delete the lock branch so a rerun can succeed
+    delete_lock_branch_on_failure_before_pr: true
+
+idempotency:
+  # Use merge_commit_sha from the merge event payload as the idempotency key
+  key: "merge_commit_sha"
+  # If a PR/branch already exists for this key, exit without creating duplicates
+  on_existing_lock: "exit" # allowed: exit | update_existing
+
+limits:
+  # Protect against oversized PRs/diffs and LLM context overflow
+  max_changed_files: 200
+  max_diff_lines: 2000
+  max_prompt_chars: 45000
+  max_generated_patch_chars: 80000
+
+llm:
+  # LLM integration is required; calls go through an enterprise secure proxy
+  provider: "enterprise_proxy"
+  model: "default"  # resolved by the proxy/environment
+  parameters:
+    temperature: 0.2
+    top_p: 1.0
+    # Max tokens requested for the completion (provider-specific enforcement may apply)
+    max_tokens: 1800
+  retry_policy:
+    # Retries for transient network/5xx errors
+    max_attempts: 3
+    backoff: "exponential"
+    initial_delay_ms: 500
+    max_delay_ms: 8000
+  timeouts:
+    connect_seconds: 5
+    read_seconds: 60
+    total_seconds: 75
+
+security:
+  # Pre-LLM redaction and post-generation scanning
+  secret_scrubbing:
+    enabled: true
+    # Optional additional patterns (regex) to redact before LLM calls
+    additional_redaction_patterns: []
+  secret_scan:
+    enabled: true
+    # Tooling is implementation-defined; use as a hint for pipeline behavior
+    tool_preference: "gitleaks" # allowed: gitleaks | regex
+  url_policy:
+    # Controls new/changed external URLs introduced by the LLM
+    enforce_allowlist: false
+    allowed_domains: []
+    blocked_domains:
+      - "bit.ly"
+      - "tinyurl.com"
+
+links:
+  # Link validation behavior applied after doc generation
+  internal:
+    mode: "block" # allowed: block | warn | off
+  external:
+    mode: "warn" # allowed: block | warn | off
+    timeout_seconds: 5
+    max_concurrency: 10
+
+observability:
+  structured_logging: true
+  include_run_summary: true
+  log_level: "INFO"
+  redact_sensitive: true
+  reason_codes_enabled: true
