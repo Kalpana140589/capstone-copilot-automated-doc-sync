@@ -1,554 +1,303 @@
 ```markdown
+# architecture.md — Automated Documentation Sync (High-Level Architecture)
 
-\# architecture.md — Automated Documentation Sync (High-Level Architecture)
-
-
-
-\## 1. Architecture Overview
-
+## 1. Architecture Overview
 Automated Documentation Sync is an event-driven automation that runs when a Pull Request is merged into the `main` branch of a single GitHub repository (`capstone-copilot-automated-doc-sync`). It analyzes code changes, determines whether Markdown documentation is outdated, uses an enterprise-approved hosted LLM (via secure proxy) to generate documentation updates, applies formatting/link quality steps, and always opens a GitHub Pull Request containing the proposed changes for human review.
 
-
-
 Key constraints from requirements:
+- **Single repo (v1)**, docs scope limited to `README.md` and `/docs/**/*.md`.
+- **Trigger** on **PR merged into `main`**, plus **manual dispatch** for testing.
+- **LLM required** via secure proxy.
+- **Always PR output**; no direct commits to `main`; no issues.
+- **SLA**: target end-to-end completion within **2–5 minutes**.
+- **Retries**: exponential backoff, **max 3** for transient GitHub/LLM/network errors.
+- **Idempotency**: no duplicate PRs for the same merge commit hash.
 
-\- \*\*Single repo (v1)\*\*, \*\*docs scope\*\* limited to `README.md` and `/docs/\*\*/\*.md`.
+Security and reliability guardrails added (per design review):
+- Use **least-privilege GitHub App** credentials (preferred) instead of PATs.
+- Perform **secret scrubbing/data minimization** before sending any context to the LLM.
+- Enforce **strict path allowlist validation** so only in-scope files can be modified.
+- Ensure **atomic idempotency** using **branch creation as a lock** + workflow concurrency.
 
-\- \*\*Trigger\*\* on \*\*PR merged into `main`\*\*, plus \*\*manual dispatch\*\* for testing.
+---
 
-\- \*\*LLM required\*\* via secure proxy.
-
-\- \*\*Always PR output\*\*; no direct commits to `main`; no issues.
-
-\- \*\*SLA\*\*: target end-to-end completion within \*\*2–5 minutes\*\*.
-
-\- \*\*Retries\*\*: exponential backoff, \*\*max 3\*\* for transient GitHub/LLM/network errors.
-
-\- \*\*Idempotency\*\*: no duplicate PRs for the same merge commit hash.
-
-
-
-\---
-
-
-
-\## 2. High-Level Component Diagram (Mermaid)
-
-
+## 2. High-Level Component Diagram (Mermaid)
 
 ```mermaid
-
 flowchart LR
+  dev[Developers] -->|Merge PR| gh[(GitHub Repo<br/>capstone-copilot-automated-doc-sync)]
 
-&#x20; dev\[Developers] -->|Merge PR| gh\[(GitHub Repo<br/>capstone-copilot-automated-doc-sync)]
+  subgraph github[GitHub Platform]
+    gh -->|PR merged event<br/>(pull_request closed=merged)| ga[GitHub Actions Workflow<br/>Trigger + Orchestration]
+    ghapi[GitHub API<br/>(REST/GraphQL)]
+  end
 
+  subgraph runner[Automation Runtime]
+    ga --> job[Sync Job Runner<br/>(container or hosted runner)]
+    job --> orch[Doc Sync Orchestrator]
 
+    orch --> conc[Concurrency Control<br/>(workflow-level)]
+    orch --> lock[Atomic Idempotency Lock<br/>(branch-create lock)]
 
-&#x20; subgraph github\[GitHub Platform]
+    orch --> diff[Diff & Context Extractor]
+    diff --> scrub[Secret Scrubber + Data Minimizer]
+    scrub --> det[Outdated-Doc Detector]
 
-&#x20;   gh -->|PR merged event<br/>(pull\_request closed=merged)| ga\[GitHub Actions Workflow<br/>Trigger + Orchestration]
+    det --> prompt[Prompt Builder<br/>(schema-constrained)]
+    prompt --> llm[Hosted LLM via Secure Proxy]
 
-&#x20;   ghapi\[GitHub API<br/>(REST/GraphQL)]
+    llm --> gen[Doc Patch Generator<br/>(schema validated)]
+    gen --> gate[Validation & Policy Gate<br/>(path allowlist, URL rules, secret scan)]
+    gate --> fmt[Markdown Formatter<br/>+ Link Update/Check]
+    fmt --> commit[Branch/Commit Writer]
+    commit --> pr[PR Creator + Labeler]
+  end
 
-&#x20; end
+  pr -->|create PR| ghapi
+  diff -->|fetch diffs, files| ghapi
+  lock -->|create branch ref as lock| ghapi
+  commit --> ghapi
 
+  subgraph obs[Observability]
+    logs[Structured Logs (redacted)]:::obs
+    summary[Run Summary (GITHUB_STEP_SUMMARY)]:::obs
+  end
 
+  orch --> logs
+  orch --> summary
+  ga --> logs
 
-&#x20; subgraph runner\[Automation Runtime]
-
-&#x20;   ga --> job\[Sync Job Runner<br/>(container or hosted runner)]
-
-&#x20;   job --> orch\[Doc Sync Orchestrator]
-
-&#x20;   orch --> idemp\[Idempotency Guard<br/>(commit-hash ledger)]
-
-&#x20;   orch --> diff\[Diff \& Context Extractor]
-
-&#x20;   diff --> det\[Outdated-Doc Detector]
-
-&#x20;   det --> prompt\[Prompt Builder]
-
-&#x20;   prompt --> llm\[Hosted LLM via Secure Proxy]
-
-&#x20;   llm --> gen\[Doc Patch Generator<br/>(apply edits)]
-
-&#x20;   gen --> fmt\[Markdown Formatter<br/>+ Link Updater/Checker]
-
-&#x20;   fmt --> commit\[Branch/Commit Writer]
-
-&#x20;   commit --> pr\[PR Creator + Labeler]
-
-&#x20; end
-
-
-
-&#x20; idemp <--> store\[(State Store<br/>Artifacts/Cache/DB)]
-
-&#x20; pr -->|create branch/commit/PR| ghapi
-
-&#x20; diff -->|fetch diffs, files| ghapi
-
-&#x20; commit --> ghapi
-
-
-
-&#x20; subgraph obs\[Observability]
-
-&#x20;   logs\[Structured Logs]:::obs
-
-&#x20;   metrics\[Metrics/Run Summary]:::obs
-
-&#x20; end
-
-
-
-&#x20; orch --> logs
-
-&#x20; orch --> metrics
-
-&#x20; ga --> logs
-
-
-
-&#x20; classDef obs fill:#f5f5f5,stroke:#999,color:#333;
-
+  classDef obs fill:#f5f5f5,stroke:#999,color:#333;
 ```
 
-
-
-\---
-
-
-
-\## 3. Recommended Technology Choices
-
-
-
-\### 3.1 Triggering \& Orchestration
-
-\- \*\*GitHub Actions\*\* (primary orchestrator)
-
-&#x20; - Event trigger: `pull\_request` with `types: \[closed]` and guard `merged == true` and `base.ref == "main"`.
-
-&#x20; - Manual trigger: `workflow\_dispatch`.
-
-
-
-\### 3.2 Sync Logic Runtime / Language
-
-\- \*\*Python\*\* (recommended for v1)
-
-&#x20; - Strong ecosystem for text processing and markdown tooling.
-
-&#x20; - Suggested libraries:
-
-&#x20;   - GitHub API: `PyGithub` or `requests`
-
-&#x20;   - Retries/backoff: `tenacity`
-
-&#x20;   - Config validation: `pydantic`
-
-\- Alternative: \*\*Node.js/TypeScript\*\*
-
-&#x20; - GitHub integration: `@actions/github`, `octokit`
-
-&#x20; - Validation: `zod`
-
-&#x20; - Retries: `p-retry`
-
-
-
-\### 3.3 GitHub PR/Branch/Commit Automation
-
-\- \*\*GitHub REST API\*\* (sufficient for v1)
-
-&#x20; - Read PR files/diffs
-
-&#x20; - Create branch refs
-
-&#x20; - Create commits
-
-&#x20; - Create PRs
-
-&#x20; - Apply labels (`documentation`, `automated`)
-
-\- Optional: \*\*GitHub GraphQL\*\* for efficient PR/branch lookup, but not required.
-
-
-
-\### 3.4 LLM Integration
-
-\- \*\*Hosted LLM via enterprise secure proxy\*\* (required)
-
-&#x20; - Enforce:
-
-&#x20;   - request timeouts
-
-&#x20;   - bounded retries (max 3)
-
-&#x20;   - request/response size limits
-
-&#x20;   - minimal necessary context sharing per enterprise guidelines
-
-
-
-\### 3.5 State / Idempotency Storage
-
-Recommended options (choose one):
-
-\- \*\*GitHub-native (simplest for capstone):\*\*
-
-&#x20; - Determine idempotency by searching for existing PR/branch named `docs-sync-<commit-hash>`.
-
-&#x20; - Optionally persist a small ledger via GitHub Actions artifacts/caches.
-
-\- \*\*External store (more “service-like”):\*\*
-
-&#x20; - DynamoDB / Redis / Postgres to store:
-
-&#x20;   - merge commit hash
-
-&#x20;   - status (success/no-op/failure)
-
-&#x20;   - PR URL/id
-
-&#x20;   - timestamps
-
-
-
-\### 3.6 Formatting \& Link Quality Gates
-
-\- Markdown formatting:
-
-&#x20; - `prettier` (Markdown formatting) and/or `markdownlint-cli2`
-
-\- Link check/update:
-
-&#x20; - `lychee` or `markdown-link-check`
-
-&#x20; - Recommended: prioritize \*\*internal relative links\*\* for determinism; treat external link failures as “flag” rather than hard fail if needed.
-
-
-
-\### 3.7 Observability
-
-\- GitHub Actions step summary:
-
-&#x20; - Use `GITHUB\_STEP\_SUMMARY` to publish run output (decision, PR URL, changed files).
-
-\- Structured logs:
-
-&#x20; - JSON logs to stdout.
-
-\- Metrics (v1):
-
-&#x20; - log-derived counts and durations (success/failure/no-op, retries, run time).
-
-
-
-\---
-
-
-
-\## 4. End-to-End Data Flow (Step-by-Step)
-
-
-
-1\. \*\*PR merge event occurs\*\*
-
-&#x20;  - A PR is merged into `main` in `capstone-copilot-automated-doc-sync`.
-
-
-
-2\. \*\*Workflow trigger\*\*
-
-&#x20;  - GitHub Actions workflow starts from the merge event.
-
-&#x20;  - Manual `workflow\_dispatch` can start the same flow for testing/debugging.
-
-
-
-3\. \*\*Run initialization\*\*
-
-&#x20;  - Orchestrator loads:
-
-&#x20;    - merge commit hash (primary idempotency key)
-
-&#x20;    - repository identifier
-
-&#x20;    - source PR number (if available)
-
-&#x20;    - current `main` reference
-
-
-
-4\. \*\*Idempotency check\*\*
-
-&#x20;  - System checks if `docs-sync-<commit-hash>` already exists as:
-
-&#x20;    - a branch ref, or
-
-&#x20;    - an open/closed PR head branch
-
-&#x20;  - If already processed, system exits cleanly (or updates the existing branch/PR if that policy is chosen).
-
-
-
-5\. \*\*Diff \& context extraction\*\*
-
-&#x20;  - Pull changed files and/or diff hunks from GitHub API for the merged PR.
-
-&#x20;  - Load current contents of:
-
-&#x20;    - `README.md`
-
-&#x20;    - relevant `/docs/\*\*/\*.md` (entire files or selected excerpts)
-
-
-
-6\. \*\*Outdated documentation detection\*\*
-
-&#x20;  - Determine whether docs likely require changes based on:
-
-&#x20;    - the diffs (e.g., changed public interfaces/config/endpoints)
-
-&#x20;    - heuristics and/or LLM-assisted classification
-
-&#x20;  - Output a deterministic decision: \*\*update needed\*\* vs \*\*no-op\*\*.
-
-
-
-7\. \*\*Prompt build \& LLM call\*\*
-
-&#x20;  - Prompt Builder packages:
-
-&#x20;    - summarized changes
-
-&#x20;    - relevant doc excerpts
-
-&#x20;    - constraints: modify only `README.md` and `/docs/\*\*/\*.md`, produce valid Markdown, update links as needed
-
-&#x20;  - LLM Client calls hosted LLM via secure proxy with retries.
-
-
-
-8\. \*\*Patch generation and application\*\*
-
-&#x20;  - Convert LLM output into file edits (recommended: unified diff or structured per-file patches).
-
-&#x20;  - Apply edits to working tree.
-
-&#x20;  - Enforce scope guardrail: no files outside `README.md` and `/docs/\*\*/\*.md` are modified.
-
-
-
-9\. \*\*Formatting and link quality steps\*\*
-
-&#x20;  - Run Markdown formatting cleanup.
-
-&#x20;  - Update and/or validate links in modified Markdown.
-
-&#x20;  - If link updates cannot be resolved deterministically:
-
-&#x20;    - fail the run, or
-
-&#x20;    - create PR and clearly flag in PR body (implementation policy decision).
-
-
-
-10\. \*\*Branch, commit, PR creation\*\*
-
-&#x20;  - Create branch: `docs-sync-<commit-hash>` off `main`.
-
-&#x20;  - Commit changes with consistent commit message.
-
-&#x20;  - Create PR targeting `main`:
-
-&#x20;    - Title: `docs: automated documentation synchronization`
-
-&#x20;    - Labels: `documentation`, `automated`
-
-
-
-11\. \*\*Reporting\*\*
-
-&#x20;  - Write PR URL and run summary to `GITHUB\_STEP\_SUMMARY`.
-
-&#x20;  - Emit structured logs including retries and outcomes.
-
-
-
-\---
-
-
-
-\## 5. Key Components \& Responsibilities
-
-
-
-\### 5.1 GitHub Actions Workflow (Trigger + Orchestration)
-
-\*\*Responsibilities\*\*
-
-\- Trigger on PR merged into `main`.
-
-\- Support `workflow\_dispatch`.
-
-\- Provide runtime environment and required secrets.
-
-\- Gate execution to intended branch and event type.
-
-
-
-\### 5.2 Doc Sync Orchestrator (Main Entry Point)
-
-\*\*Responsibilities\*\*
-
-\- Coordinate end-to-end execution steps.
-
-\- Maintain run context (repo, merge commit hash, timestamps).
-
-\- Enforce scope: only `README.md` and `/docs/\*\*/\*.md`.
-
-\- Produce final run outcome: success / no-op / failure.
-
-
-
-\### 5.3 Idempotency Guard (Commit-Hash Ledger)
-
-\*\*Responsibilities\*\*
-
-\- Prevent duplicate PRs per merge commit hash.
-
-\- Check existing `docs-sync-<commit-hash>` branch/PR and/or external ledger.
-
-\- Decide behavior on re-run:
-
-&#x20; - exit cleanly, or
-
-&#x20; - update existing PR branch (must be consistent and logged).
-
-
-
-\### 5.4 Diff \& Context Extractor
-
-\*\*Responsibilities\*\*
-
-\- Fetch PR file list, diffs, and relevant metadata from GitHub API.
-
-\- Load current Markdown docs in-scope.
-
-\- Reduce/summarize context to fit LLM token and policy constraints.
-
-
-
-\### 5.5 Outdated-Doc Detector
-
-\*\*Responsibilities\*\*
-
-\- Determine if documentation updates are needed.
-
-\- Ensure deterministic decision output per run (record rationale in logs/summary).
-
-
-
-\### 5.6 Prompt Builder
-
-\*\*Responsibilities\*\*
-
-\- Build structured prompts with:
-
-&#x20; - change summaries/diff excerpts
-
-&#x20; - existing doc excerpts
-
-&#x20; - formatting/link constraints
-
-&#x20; - allowed file list enforcement
-
-\- Apply redaction/minimization if required by enterprise policy.
-
-
-
-\### 5.7 LLM Client (Secure Proxy Integration)
-
-\*\*Responsibilities\*\*
-
-\- Execute hosted LLM calls via secure proxy.
-
-\- Implement timeouts and retries (exponential backoff, max 3).
-
-\- Capture diagnostic metadata without leaking secrets or sensitive content.
-
-
-
-\### 5.8 Doc Patch Generator / Applier
-
-\*\*Responsibilities\*\*
-
-\- Translate LLM output to deterministic file edits.
-
-\- Apply patches safely; detect conflicts/un-applicable diffs.
-
-\- Validate resulting Markdown files are syntactically valid and within scope.
-
-
-
-\### 5.9 Markdown Formatter + Link Updater/Checker
-
-\*\*Responsibilities\*\*
-
-\- Apply Markdown formatting cleanup consistently.
-
-\- Update internal relative links when paths/anchors change.
-
-\- Validate links (at minimum internal links; external optional with a defined policy).
-
-
-
-\### 5.10 PR Automation Service (GitHub Writer)
-
-\*\*Responsibilities\*\*
-
-\- Create branch `docs-sync-<commit-hash>`.
-
-\- Commit file changes.
-
-\- Create PR with standardized metadata:
-
-&#x20; - title: `docs: automated documentation synchronization`
-
-&#x20; - labels: `documentation`, `automated`
-
-\- Include PR body summary (source PR, summary of doc changes, known limitations).
-
-
-
-\### 5.11 Observability \& Reporting
-
-\*\*Responsibilities\*\*
-
-\- Emit structured logs for each run:
-
-&#x20; - trigger type, merge commit hash, decision, retries, PR URL
-
-\- Produce a GitHub Actions run summary (`GITHUB\_STEP\_SUMMARY`).
-
-\- Track basic metrics (duration, success/no-op/failure counts, retry counts).
-
-
-
-\---
-
-
-
-\## 6. Notes / Implementation Guardrails (Recommended)
-
-\- Enforce “in-scope only” edits by hard-checking the modified file list before commit.
-
-\- Prefer a machine-applicable LLM output format (e.g., per-file unified diffs) to reduce risk of malformed updates.
-
-\- Keep prompts minimal and contextual to comply with enterprise data guidelines and to improve performance within the 2–5 minute SLA.
-
+---
+
+## 3. Recommended Technology Choices
+
+### 3.1 Triggering & Orchestration
+- **GitHub Actions** (primary orchestrator)
+  - Event trigger: `pull_request` with `types: [closed]` and guard `merged == true` and `base.ref == "main"`.
+  - Manual trigger: `workflow_dispatch`.
+  - **Concurrency guardrail (required):**
+    - Configure `concurrency.group` keyed by merge commit hash to avoid parallel runs generating duplicate PRs.
+
+### 3.2 Sync Logic Runtime / Language
+- **Python** (recommended for v1)
+  - Suggested libraries:
+    - GitHub API: `PyGithub` or `requests`
+    - Retries/backoff: `tenacity`
+    - Config validation/schemas: `pydantic`
+- Alternative: **Node.js/TypeScript**
+  - GitHub integration: `@actions/github`, `octokit`
+  - Validation: `zod`
+  - Retries: `p-retry`
+
+### 3.3 GitHub Authentication (Least Privilege)
+- **Preferred:** **GitHub App** installation token (short-lived) rather than PAT.
+  - Recommended permissions (adjust to minimum necessary):
+    - **Contents:** Read/Write (needed to create branch + commit)
+    - **Pull requests:** Read/Write (needed to open PR)
+    - **Metadata:** Read
+- Secrets storage: **GitHub Actions Secrets** (or equivalent) only.
+- Logging: never log tokens or raw headers; redact any accidental occurrences.
+
+### 3.4 LLM Integration (Secure Proxy)
+- **Hosted LLM via enterprise secure proxy** (required)
+  - Enforce:
+    - request timeouts
+    - bounded retries (max 3)
+    - request/response size limits
+    - **data minimization** (send smallest viable context)
+    - optional “no retention/zero log” mode if available
+
+### 3.5 State / Idempotency Storage (Atomic Locking)
+- **Primary idempotency mechanism (required):** **Branch-create lock**
+  - Attempt to create branch ref: `docs-sync-<commit-hash>` off `main`.
+  - If branch already exists, treat as “already processed / in progress” and:
+    - exit cleanly, or
+    - update existing PR branch (if policy allows; must be consistent).
+- **Optional additional ledger:** GitHub-native artifacts/caches or external DB for richer audit trails.
+
+### 3.6 Formatting & Link Quality Gates
+- Markdown formatting:
+  - `prettier` (Markdown) and/or `markdownlint-cli2`
+- Link check/update:
+  - Prefer deterministic internal link checks; external links optionally flagged with timeouts.
+
+### 3.7 Observability
+- **Structured logs (JSON)** to stdout with **redaction**.
+- GitHub Actions step summary via `GITHUB_STEP_SUMMARY`.
+- Track log-derived metrics: duration, outcome, retry counts, files changed.
+
+---
+
+## 4. End-to-End Data Flow (Step-by-Step)
+
+1. **PR merge event occurs**
+   - A PR is merged into `main`.
+
+2. **Workflow trigger & concurrency**
+   - GitHub Actions workflow starts.
+   - Workflow applies **concurrency grouping** to prevent two runs for the same merge commit hash.
+
+3. **Run initialization**
+   - Orchestrator loads:
+     - merge commit hash (idempotency key)
+     - repository identifier
+     - source PR number (if available)
+
+4. **Atomic idempotency lock (branch-create lock)**
+   - System attempts to create branch ref `docs-sync-<commit-hash>` off `main`.
+   - Outcomes:
+     - **Success:** lock acquired; proceed.
+     - **Already exists:** treat as already processed/in-progress; exit cleanly (or optionally update PR branch based on defined policy).
+
+5. **Diff & context extraction**
+   - Fetch changed files and diffs via GitHub API.
+   - Load current in-scope docs content:
+     - `README.md`
+     - `/docs/**/*.md` (full file or relevant excerpts)
+
+6. **Secret scrubbing & data minimization (before LLM)**
+   - Apply a **Secret Scrubber** to all candidate LLM inputs:
+     - remove/replace secret-like patterns (tokens, keys, credentials)
+     - redact high-risk literals and credential formats
+   - Minimize context:
+     - include only relevant diff hunks/summaries and doc excerpts required for the update
+
+7. **Outdated documentation detection**
+   - Decide “update needed” vs “no-op” deterministically.
+   - If no update needed:
+     - write run summary, release/close lock context (branch may remain unused depending on policy; recommended to delete the lock branch if no-op, see Notes).
+
+8. **Prompt build & LLM call**
+   - Prompt Builder constructs a schema-constrained request specifying:
+     - allowed file paths
+     - required output format (structured patches)
+     - formatting/link expectations
+   - LLM Client calls hosted LLM via secure proxy with retries.
+
+9. **Patch generation and application**
+   - Patch Generator validates output against strict schema.
+   - Apply edits only to in-scope files.
+
+10. **Validation & Policy Gate (required)**
+   - Hard validations before commit:
+     - **Path allowlist enforcement:** modified files must be exactly `README.md` or under `/docs/**/*.md`.
+     - **No out-of-scope writes:** fail if any other file changes are present.
+     - **Secret scan of generated content:** fail if secret-like patterns appear post-generation.
+     - Optional: URL/domain allowlist (prevent malicious outbound links).
+
+11. **Formatting and link quality steps**
+   - Run Markdown formatter.
+   - Update and/or validate links in modified Markdown.
+   - Apply defined policy for failures (fail run vs flag in PR body).
+
+12. **Commit and PR creation**
+   - Commit changes on existing lock branch `docs-sync-<commit-hash>`.
+   - Create PR targeting `main`:
+     - Title: `docs: automated documentation synchronization`
+     - Labels: `documentation`, `automated`
+
+13. **Reporting**
+   - Write PR URL and summary to `GITHUB_STEP_SUMMARY`.
+   - Emit structured logs (redacted) including retries and outcomes.
+
+---
+
+## 5. Key Components & Responsibilities
+
+### 5.1 GitHub Actions Workflow (Trigger + Orchestration)
+**Responsibilities**
+- Trigger on PR merged into `main`.
+- Support `workflow_dispatch`.
+- Provide runtime environment and required secrets.
+- Enforce workflow **concurrency** keyed by merge commit hash.
+
+### 5.2 Doc Sync Orchestrator (Main Entry Point)
+**Responsibilities**
+- Coordinate end-to-end execution steps.
+- Maintain run context (repo, merge commit hash, timestamps).
+- Enforce scope: only `README.md` and `/docs/**/*.md`.
+- Produce final run outcome: success / no-op / failure.
+
+### 5.3 Atomic Idempotency Lock (Branch-Create Lock)
+**Responsibilities**
+- Acquire idempotency lock by attempting to create `docs-sync-<commit-hash>` branch ref.
+- Provide atomic protection against concurrent runs.
+- Define consistent behavior when branch already exists (exit vs update).
+
+### 5.4 Diff & Context Extractor
+**Responsibilities**
+- Fetch PR file list, diffs, and metadata from GitHub API.
+- Load current Markdown docs in-scope.
+- Reduce context for downstream processing.
+
+### 5.5 Secret Scrubber + Data Minimizer
+**Responsibilities**
+- Scrub secret-like strings from diffs/docs before LLM calls.
+- Enforce data minimization: send only required excerpts/summaries to LLM.
+- Ensure logs and summaries never include raw secrets or raw token-like artifacts.
+
+### 5.6 Outdated-Doc Detector
+**Responsibilities**
+- Determine if documentation updates are needed.
+- Output deterministic decision + rationale (logged/redacted).
+
+### 5.7 Prompt Builder (Schema-Constrained)
+**Responsibilities**
+- Build prompts that:
+  - specify allowed paths and formatting/link constraints
+  - require machine-parseable output (structured patch format)
+- Apply redaction/minimization rules.
+
+### 5.8 LLM Client (Secure Proxy Integration)
+**Responsibilities**
+- Execute hosted LLM calls via secure proxy.
+- Implement timeouts and retries (exponential backoff, max 3).
+- Record diagnostics without leaking sensitive content.
+
+### 5.9 Doc Patch Generator / Applier (Schema Validated)
+**Responsibilities**
+- Validate LLM output against strict schema.
+- Apply patches deterministically to working tree.
+- Fail safely if patch is malformed or unapplicable.
+
+### 5.10 Validation & Policy Gate (Required)
+**Responsibilities**
+- Enforce **path allowlist** (only `README.md` and `/docs/**/*.md`).
+- Ensure no out-of-scope file modifications.
+- Run secret scan on generated content (block secrets from being introduced into docs).
+- Optional: restrict new URLs/domains and reject suspicious patterns.
+
+### 5.11 Markdown Formatter + Link Updater/Checker
+**Responsibilities**
+- Apply Markdown formatting cleanup consistently.
+- Update internal relative links when necessary.
+- Validate links per defined policy (internal required; external optional/flagged).
+
+### 5.12 PR Automation Service (GitHub Writer)
+**Responsibilities**
+- Commit changes to `docs-sync-<commit-hash>` branch.
+- Create PR with standardized metadata:
+  - title: `docs: automated documentation synchronization`
+  - labels: `documentation`, `automated`
+- Keep PR body minimal and safe (avoid including large diffs or sensitive content).
+
+### 5.13 Observability & Reporting
+**Responsibilities**
+- Emit **structured, redacted** logs:
+  - trigger type, merge commit hash, decision, retries, PR URL
+- Produce GitHub Actions run summary (`GITHUB_STEP_SUMMARY`).
+- Track basic metrics (duration, success/no-op/failure counts, retry counts).
+
+---
+
+## 6. Notes / Implementation Guardrails (Required)
+- **Least privilege:** Use GitHub App tokens where possible; avoid PATs.
+- **Atomic idempotency:** Use branch-create as lock + Actions concurrency to prevent duplicates under concurrent deliveries.
+- **Strict allowlist:** Fail the run if any file outside `README.md` and `/docs/**/*.md` is modified.
+- **Secret safety:** Scrub secrets before LLM calls and scan generated output for secret-like patterns before committing.
+- **Logging hygiene:** Do not log raw diffs/prompts/responses. Log identifiers, counts, and redacted summaries.
+- **Optional cleanup:** If lock branch is created but run results in no-op or hard failure before PR creation, consider deleting the lock branch to avoid clutter (ensure behavior remains idempotent and documented).
 ```
-
